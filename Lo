@@ -1,0 +1,188 @@
+-- Heartbeat Startup (ComputerCraft)
+-- Saves config, auto-runs on chunk load, sends heartbeat to your ngrok-backed Python server.
+
+local CONFIG_PATH = "hb_config.txt"
+
+local function fileExists(path)
+  local f = fs.open(path, "r")
+  if f then f.close() return true end
+  return false
+end
+
+local function readAll(path)
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local s = f.readAll()
+  f.close()
+  return s
+end
+
+local function writeAll(path, s)
+  local f = fs.open(path, "w")
+  f.write(s)
+  f.close()
+end
+
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Minimal JSON encoder for simple tables (string/number/bool/nil + array of strings)
+local function jsonEscape(s)
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub("\"", "\\\"")
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  s = s:gsub("\t", "\\t")
+  return s
+end
+
+local function toJson(v)
+  local t = type(v)
+  if t == "nil" then return "null" end
+  if t == "number" then return tostring(v) end
+  if t == "boolean" then return v and "true" or "false" end
+  if t == "string" then return "\"" .. jsonEscape(v) .. "\"" end
+  if t == "table" then
+    -- detect array
+    local isArray = true
+    local n = 0
+    for k,_ in pairs(v) do
+      if type(k) ~= "number" then isArray = false break end
+      if k > n then n = k end
+    end
+    if isArray then
+      local parts = {}
+      for i=1,n do
+        parts[#parts+1] = toJson(v[i])
+      end
+      return "[" .. table.concat(parts, ",") .. "]"
+    else
+      local parts = {}
+      for k,val in pairs(v) do
+        parts[#parts+1] = toJson(tostring(k)) .. ":" .. toJson(val)
+      end
+      return "{" .. table.concat(parts, ",") .. "}"
+    end
+  end
+  return "\"<unsupported>\""
+end
+
+local function promptOnce(label)
+  term.write(label)
+  return trim(read() or "")
+end
+
+local function loadConfig()
+  if not fileExists(CONFIG_PATH) then return nil end
+  local raw = readAll(CONFIG_PATH)
+  if not raw then return nil end
+  local cfg = {}
+  for line in raw:gmatch("[^\n]+") do
+    local k,v = line:match("^(.-)=(.*)$")
+    if k then cfg[trim(k)] = trim(v) end
+  end
+  if cfg.name and cfg.url then return cfg end
+  return nil
+end
+
+local function saveConfig(cfg)
+  local lines = {}
+  lines[#lines+1] = "name=" .. (cfg.name or "")
+  lines[#lines+1] = "url=" .. (cfg.url or "")
+  lines[#lines+1] = "token=" .. (cfg.token or "")
+  writeAll(CONFIG_PATH, table.concat(lines, "\n"))
+end
+
+local function ensureConfig()
+  local cfg = loadConfig()
+  if cfg then return cfg end
+
+  print("=== Heartbeat setup (first run) ===")
+  print("This will be saved to disk.")
+  local name = promptOnce("Computer name/ID (unique): ")
+  while name == "" do
+    name = promptOnce("Name cannot be empty. Enter again: ")
+  end
+
+  print("Example: https://abcd-12-34-56.ngrok-free.app/heartbeat")
+  local url = promptOnce("Receiver URL: ")
+  while url == "" do
+    url = promptOnce("URL cannot be empty. Enter again: ")
+  end
+
+  local token = promptOnce("Shared secret token (optional, Enter to skip): ")
+
+  cfg = { name = name, url = url, token = token }
+  saveConfig(cfg)
+  print("Saved: " .. CONFIG_PATH)
+  return cfg
+end
+
+-- Try to detect nearby players if you have a compatible peripheral/mod.
+-- If you don't, this will just return nil.
+local function getPlayersNearby()
+  -- Plethora player detector is commonly named "playerDetector"
+  local det = peripheral.find and peripheral.find("playerDetector") or nil
+  if det then
+    -- Method name differs by modpack; try a couple patterns.
+    if det.getPlayersInRange then
+      local ok, res = pcall(det.getPlayersInRange, det, 32) -- radius 32 blocks
+      if ok then return res end
+    end
+    if det.getPlayers then
+      local ok, res = pcall(det.getPlayers, det)
+      if ok then return res end
+    end
+  end
+  return nil
+end
+
+local function heartbeatLoop(cfg)
+  if not http then
+    print("ERROR: http API is not available/enabled on this server.")
+    print("Enable ComputerCraft HTTP in the server config.")
+    return
+  end
+
+  local interval = 10          -- seconds between heartbeats
+  local failDelay = 5          -- base retry delay
+  local maxFailDelay = 60      -- cap backoff
+
+  local failBackoff = failDelay
+  local bootUptime = os.clock()
+
+  while true do
+    local payload = {
+      name = cfg.name,
+      computer_id = os.getComputerID(),
+      label = os.getComputerLabel(),
+      uptime_sec = math.floor(os.clock()),
+      since_boot_sec = math.floor(os.clock() - bootUptime),
+      players_nearby = getPlayersNearby(),
+      token = (cfg.token ~= "" and cfg.token or nil),
+    }
+
+    local body = toJson(payload)
+    local headers = { ["Content-Type"] = "application/json" }
+
+    local ok, resp = pcall(http.post, cfg.url, body, headers) -- ComputerCraft http.post :contentReference[oaicite:3]{index=3}
+
+    if ok and resp then
+      -- Consume response body (optional)
+      resp.readAll()
+      resp.close()
+      failBackoff = failDelay
+      sleep(interval)
+    else
+      -- network/server down, ngrok changed, etc.
+      print("Heartbeat failed. Retrying in " .. failBackoff .. "s")
+      sleep(failBackoff)
+      failBackoff = math.min(maxFailDelay, failBackoff * 2)
+    end
+  end
+end
+
+local cfg = ensureConfig()
+print("Heartbeat running as '" .. cfg.name .. "' -> " .. cfg.url)
+heartbeatLoop(cfg)
