@@ -1,0 +1,223 @@
+-- Discord Webhook Heartbeat (ComputerCraft 1.7.10)
+-- FIX: uses http.request + pullEvent to avoid "only works after right-click" HTTP quirk.
+
+local CONFIG_PATH = "hb_config.txt"
+local QUEUE_PATH  = "hb_queue.txt"
+
+local HEARTBEAT_INTERVAL = 30   -- seconds (>=10 recommended)
+local FLUSH_MAX = 5             -- queued messages flushed per loop
+local HTTP_TIMEOUT = 10         -- seconds to wait for http_success/failure
+
+-- ---------- helpers ----------
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function fileExists(path)
+  local f = fs.open(path, "r")
+  if f then f.close() return true end
+  return false
+end
+
+local function readAll(path)
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local s = f.readAll()
+  f.close()
+  return s
+end
+
+local function writeAll(path, s)
+  local f = fs.open(path, "w")
+  f.write(s)
+  f.close()
+end
+
+local function appendLine(path, line)
+  local f = fs.open(path, "a")
+  f.writeLine(line)
+  f.close()
+end
+
+local function prompt(label)
+  term.write(label)
+  return trim(read() or "")
+end
+
+-- ---------- minimal JSON (strings only) ----------
+local function jsonEscape(s)
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub("\"", "\\\"")
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  return s
+end
+
+local function toJson(tbl)
+  local parts = {}
+  for k, v in pairs(tbl) do
+    parts[#parts+1] =
+      "\"" .. jsonEscape(k) .. "\":\"" .. jsonEscape(tostring(v)) .. "\""
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- ---------- config ----------
+local function loadConfig()
+  if not fileExists(CONFIG_PATH) then return nil end
+  local raw = readAll(CONFIG_PATH)
+  if not raw then return nil end
+
+  local cfg = {}
+  for line in raw:gmatch("[^\n]+") do
+    local k, v = line:match("^(.-)=(.*)$")
+    if k then cfg[trim(k)] = trim(v) end
+  end
+
+  if cfg.name and cfg.webhook then return cfg end
+  return nil
+end
+
+local function saveConfig(cfg)
+  writeAll(CONFIG_PATH,
+    "name=" .. cfg.name .. "\n" ..
+    "webhook=" .. cfg.webhook .. "\n"
+  )
+end
+
+local function ensureConfig()
+  local cfg = loadConfig()
+  if cfg then return cfg end
+
+  local name = prompt("Computer name/ID: ")
+  while name == "" do
+    name = prompt("Name cannot be empty. Enter again: ")
+  end
+
+  local webhook = prompt("Discord webhook URL: ")
+  while webhook == "" do
+    webhook = prompt("Webhook cannot be empty. Enter again: ")
+  end
+
+  cfg = { name = name, webhook = webhook }
+  saveConfig(cfg)
+  return cfg
+end
+
+-- ---------- queue ----------
+local function readQueue()
+  if not fileExists(QUEUE_PATH) then return {} end
+  local raw = readAll(QUEUE_PATH) or ""
+  local lines = {}
+  for l in raw:gmatch("[^\n]+") do
+    lines[#lines+1] = l
+  end
+  return lines
+end
+
+local function writeQueue(lines)
+  if #lines == 0 then
+    if fileExists(QUEUE_PATH) then fs.delete(QUEUE_PATH) end
+  else
+    writeAll(QUEUE_PATH, table.concat(lines, "\n") .. "\n")
+  end
+end
+
+local function queueMessage(msg)
+  appendLine(QUEUE_PATH, msg)
+end
+
+-- ---------- HTTP send (async, event-driven) ----------
+local function postDiscord(webhook, username, content)
+  if not http or not http.request then return false end
+
+  if #content > 1900 then
+    content = content:sub(1, 1900) .. "..."
+  end
+
+  local body = toJson({
+    username = username,
+    content  = content
+  })
+
+  local headers = { ["Content-Type"] = "application/json" }
+
+  -- Start async request
+  local ok = http.request(webhook, body, headers)
+  if not ok then
+    return false
+  end
+
+  -- Wait for completion
+  local timer = os.startTimer(HTTP_TIMEOUT)
+  while true do
+    local ev, p1, p2 = os.pullEvent()
+
+    if ev == "http_success" then
+      local url, handle = p1, p2
+      if url == webhook then
+        -- success
+        handle.readAll()
+        handle.close()
+        return true
+      else
+        -- Some other http request; ignore
+        if handle and handle.close then handle.close() end
+      end
+
+    elseif ev == "http_failure" then
+      local url, err = p1, p2
+      if url == webhook then
+        return false
+      end
+
+    elseif ev == "timer" and p1 == timer then
+      return false
+    end
+  end
+end
+
+local function flushQueue(cfg)
+  local lines = readQueue()
+  if #lines == 0 then return end
+
+  local remaining = {}
+  local sent = 0
+
+  for i = 1, #lines do
+    if sent < FLUSH_MAX then
+      if postDiscord(cfg.webhook, cfg.name, lines[i]) then
+        sent = sent + 1
+      else
+        for j = i, #lines do
+          remaining[#remaining+1] = lines[j]
+        end
+        break
+      end
+    else
+      remaining[#remaining+1] = lines[i]
+    end
+  end
+
+  writeQueue(remaining)
+end
+
+-- ---------- main ----------
+local cfg = ensureConfig()
+
+-- Send one boot marker (queued if offline)
+queueMessage(string.format("[BOOT] name=%s id=%d", cfg.name, os.getComputerID()))
+flushQueue(cfg)
+
+while true do
+  local msg = string.format(
+    "[HB] name=%s id=%d uptime=%ds",
+    cfg.name,
+    os.getComputerID(),
+    math.floor(os.clock())
+  )
+
+  queueMessage(msg)
+  flushQueue(cfg)
+  sleep(HEARTBEAT_INTERVAL)
+end
