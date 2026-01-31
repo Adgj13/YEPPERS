@@ -1,0 +1,199 @@
+-- startup (ComputerCraft 1.7.10)
+-- Polling heartbeat -> Vercel relay -> Discord
+-- Config: hb_cfg.txt (name, relay, key)
+-- Queue:  hb_queue.txt
+
+local CONFIG_PATH = "hb_cfg.txt"
+local QUEUE_PATH  = "hb_queue.txt"
+
+local INTERVAL = 30      -- seconds between heartbeats
+local TIMEOUT  = 10      -- seconds to wait for http response
+
+-- ---------- utils ----------
+local function trim(s) return (s:gsub("^%s+",""):gsub("%s+$","")) end
+
+local function exists(p)
+  local f = fs.open(p, "r")
+  if f then f.close(); return true end
+  return false
+end
+
+local function readAll(p)
+  local f = fs.open(p, "r")
+  if not f then return nil end
+  local s = f.readAll()
+  f.close()
+  return s
+end
+
+local function writeAll(p, s)
+  local f = fs.open(p, "w")
+  f.write(s)
+  f.close()
+end
+
+local function appendLine(p, line)
+  local f = fs.open(p, "a")
+  f.writeLine(line)
+  f.close()
+end
+
+local function prompt(label)
+  term.write(label)
+  return trim(read() or "")
+end
+
+-- ---------- tiny JSON encoder (string values only) ----------
+local function jsonEscape(s)
+  return (s:gsub("\\","\\\\")
+           :gsub("\"","\\\"")
+           :gsub("\n","\\n")
+           :gsub("\r","\\r")
+           :gsub("\t","\\t"))
+end
+
+local function toJson(t)
+  local parts = {}
+  for k,v in pairs(t) do
+    parts[#parts+1] = "\"" .. jsonEscape(tostring(k)) .. "\":\"" .. jsonEscape(tostring(v)) .. "\""
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- ---------- config ----------
+local function loadConfig()
+  if not exists(CONFIG_PATH) then return nil end
+  local raw = readAll(CONFIG_PATH) or ""
+  local cfg = {}
+  for line in raw:gmatch("[^\n]+") do
+    local k,v = line:match("^(.-)=(.*)$")
+    if k then cfg[trim(k)] = trim(v) end
+  end
+  if cfg.name and cfg.relay and cfg.key and cfg.name ~= "" and cfg.relay ~= "" then
+    return cfg
+  end
+  return nil
+end
+
+local function saveConfig(cfg)
+  writeAll(CONFIG_PATH,
+    "name="  .. cfg.name  .. "\n" ..
+    "relay=" .. cfg.relay .. "\n" ..
+    "key="   .. cfg.key   .. "\n"
+  )
+end
+
+local function ensureConfig()
+  local cfg = loadConfig()
+  if cfg then return cfg end
+
+  local name = prompt("Computer name: ")
+  while name == "" do name = prompt("Name cannot be empty: ") end
+
+  term.write("Relay URL (must end with /api/relay): ")
+  local relay = trim(read() or "")
+  while relay == "" do
+    term.write("Relay URL cannot be empty: ")
+    relay = trim(read() or "")
+  end
+
+  local key = prompt("Relay key: ")
+  while key == "" do key = prompt("Key cannot be empty: ") end
+
+  cfg = { name = name, relay = relay, key = key }
+  saveConfig(cfg)
+  return cfg
+end
+
+-- ---------- queue ----------
+local function readQueue()
+  if not exists(QUEUE_PATH) then return {} end
+  local raw = readAll(QUEUE_PATH) or ""
+  local lines = {}
+  for l in raw:gmatch("[^\n]+") do lines[#lines+1] = l end
+  return lines
+end
+
+local function writeQueue(lines)
+  if #lines == 0 then
+    if exists(QUEUE_PATH) then fs.delete(QUEUE_PATH) end
+  else
+    writeAll(QUEUE_PATH, table.concat(lines, "\n") .. "\n")
+  end
+end
+
+local function queue(line)
+  appendLine(QUEUE_PATH, line)
+end
+
+-- ---------- HTTP POST (event-driven) ----------
+local function postRelay(cfg, msg)
+  if not http or not http.request then return false end
+
+  local body = toJson({ name = cfg.name, msg = msg })
+  local headers = {
+    ["Content-Type"] = "application/json",
+    ["x-auth"] = cfg.key
+  }
+
+  if not http.request(cfg.relay, body, headers) then
+    return false
+  end
+
+  local t = os.startTimer(TIMEOUT)
+
+  while true do
+    local ev, a, b = os.pullEvent()
+    if ev == "http_success" then
+      local url, h = a, b
+      if url == cfg.relay then
+        h.readAll(); h.close()
+        return true
+      else
+        if h and h.close then h.close() end
+      end
+    elseif ev == "http_failure" then
+      local url = a
+      if url == cfg.relay then
+        return false
+      end
+    elseif ev == "timer" and a == t then
+      return false
+    end
+  end
+end
+
+local function flush(cfg)
+  local q = readQueue()
+  if #q == 0 then return end
+
+  local remaining = {}
+  for i=1,#q do
+    if postRelay(cfg, q[i]) then
+      -- sent ok
+    else
+      for j=i,#q do remaining[#remaining+1] = q[j] end
+      break
+    end
+  end
+  writeQueue(remaining)
+end
+
+-- ---------- main ----------
+local cfg = ensureConfig()
+
+-- optional: clear screen / small status
+term.clear()
+term.setCursorPos(1,1)
+print("HB polling active. ID=" .. os.getComputerID())
+
+-- send a boot marker first
+queue("[BOOT] id=" .. os.getComputerID())
+flush(cfg)
+
+while true do
+  local msg = "[HB] id=" .. os.getComputerID() .. " uptime=" .. math.floor(os.clock())
+  queue(msg)
+  flush(cfg)
+  sleep(INTERVAL)
+end
