@@ -1,197 +1,169 @@
-import time
-import threading
-import asyncio
-from collections import deque
+-- remote_controller.lua
+-- Integrated commands: inspect + destroy + optional run
+-- CC: serializeJSON YES, unserializeJSON NO, so /next must be Lua-table string.
 
-from flask import Flask, jsonify, request
+local BASE_URL = "https://sixtypenny-occupiedly-leila.ngrok-free.dev"
+local POLL_DELAY = 10
 
-import discord
-from discord.ext import commands
-
-# ---------------- CONFIG ----------------
-BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
-HTTP_PORT = 8080
-
-# Keep run whitelist for other scripts (optional)
-SCRIPT_WHITELIST = {
-    "status.lua",
+local SCRIPT_WHITELIST = {
+  ["status.lua"] = true,
 }
 
-# ---------------- STATE ----------------
-queue = deque()
-pending = {}
-last_results = deque(maxlen=20)
+local function httpGetCmd(path)
+  local h = http.get(BASE_URL .. path)
+  if not h then return nil end
+  local body = h.readAll()
+  h.close()
+  local ok, obj = pcall(textutils.unserialize, body)
+  if ok then return obj end
+  return nil
+end
 
-app = Flask(__name__)
+local function httpPostJSON(path, data)
+  local payload = textutils.serializeJSON(data)
+  local h = http.post(BASE_URL .. path, payload, { ["Content-Type"] = "application/json" })
+  if not h then return false end
+  h.close()
+  return true
+end
 
-# ---------------- HELPERS ----------------
-def new_cmd_id(prefix: str) -> str:
-    return f"{prefix}-{int(time.time())}-{len(pending)+1}"
+local function getInvSize(inv)
+  if type(inv.size) == "function" then
+    local ok, v = pcall(inv.size)
+    if ok and type(v) == "number" then return v end
+  end
+  if type(inv.getInventorySize) == "function" then
+    local ok, v = pcall(inv.getInventorySize)
+    if ok and type(v) == "number" then return v end
+  end
+  return 0
+end
 
-def chunk_text(text: str, limit: int = 1900):
-    if not text:
-        return ["(empty)"]
-    return [text[i:i+limit] for i in range(0, len(text), limit)]
+local function inspectInventories()
+  local result = {}
+  local names = peripheral.getNames()
 
-def to_lua_table(obj) -> str:
-    if obj is None:
-        return "nil"
-    if isinstance(obj, bool):
-        return "true" if obj else "false"
-    if isinstance(obj, (int, float)):
-        return str(obj)
-    if isinstance(obj, str):
-        s = obj.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{s}"'
-    if isinstance(obj, (list, tuple)):
-        return "{" + ",".join(to_lua_table(x) for x in obj) + "}"
-    if isinstance(obj, dict):
-        parts = []
-        for k, v in obj.items():
-            if isinstance(k, str) and k.isidentifier():
-                parts.append(f"{k}={to_lua_table(v)}")
-            else:
-                parts.append(f"[{to_lua_table(k)}]={to_lua_table(v)}")
-        return "{" + ",".join(parts) + "}"
-    return to_lua_table(str(obj))
+  for i = 1, #names do
+    local side = names[i]
+    local inv = peripheral.wrap(side)
 
-def format_inspect(inventories: dict) -> str:
-    if not inventories:
-        return "(no inventories returned)"
-    preferred = ["top", "bottom", "left", "right", "front", "back", "up", "down"]
-    sides = sorted(inventories.keys(), key=lambda s: (preferred.index(s) if s in preferred else 999, s))
-    lines = []
-    for side in sides:
-        items = inventories.get(side) or []
-        lines.append(f"**{side}** ({len(items)} stacks)")
-        if not items:
-            lines.append("- (empty)\n")
-            continue
-        items = sorted(items, key=lambda it: int(it.get("slot", 0)))
-        for it in items:
-            slot = it.get("slot", "?")
-            name = it.get("name", "?")
-            count = it.get("count", "?")
-            dmg = it.get("damage", 0)
-            if dmg and int(dmg) != 0:
-                lines.append(f"- slot {slot}: `{name}` x{count} (dmg {dmg})")
-            else:
-                lines.append(f"- slot {slot}: `{name}` x{count}")
-        lines.append("")
-    return "\n".join(lines).strip()
+    if inv and type(inv.getStackInSlot) == "function" then
+      local size = getInvSize(inv)
+      local slots = {}
 
-# ---------------- DISCORD BOT ----------------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+      for slot = 1, size do
+        local ok, stack = pcall(inv.getStackInSlot, slot)
+        if ok and stack then
+          slots[#slots + 1] = {
+            slot = slot,
+            name = stack.name or stack.id or "?",
+            count = stack.count or stack.qty or 1,
+            damage = stack.damage or 0
+          }
+        end
+      end
 
-async def send_channel(channel_id: int, text: str):
-    ch = bot.get_channel(channel_id)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(channel_id)
-        except Exception:
-            return
-    for part in chunk_text(text):
-        await ch.send(part)
+      result[side] = slots
+    end
+  end
 
-def send_channel_threadsafe(channel_id: int, text: str):
-    asyncio.run_coroutine_threadsafe(send_channel(channel_id, text), bot.loop)
+  return result
+end
 
-@bot.event
-async def on_ready():
-    print("Bot logged in as", bot.user)
+-- Integrated destroy: destroys everything ONLY on inventories that expose destroyStack
+local function destroyAll()
+  local names = peripheral.getNames()
+  local deleted = 0
+  local scanned_slots = 0
+  local touched_inventories = 0
 
-@bot.command()
-async def inspect(ctx):
-    cmd_id = new_cmd_id("inspect")
-    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "inspect", "ts": time.time()}
-    queue.append({"id": cmd_id, "cmd": "inspect"})
-    await ctx.send("Queued inspect")
+  for i = 1, #names do
+    local side = names[i]
+    local inv = peripheral.wrap(side)
 
-@bot.command()
-async def destroy(ctx):
-    # Destroys stacks via polling program (no separate file)
-    cmd_id = new_cmd_id("destroy")
-    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "destroy", "ts": time.time()}
-    queue.append({"id": cmd_id, "cmd": "destroy"})
-    await ctx.send("Queued destroy")
+    if inv and type(inv.destroyStack) == "function" then
+      touched_inventories = touched_inventories + 1
+      local size = getInvSize(inv)
 
-@bot.command()
-async def run(ctx, script: str, *args):
-    script = script.strip()
-    if script not in SCRIPT_WHITELIST:
-        await ctx.send("Not allowed. Whitelist: " + ", ".join(sorted(SCRIPT_WHITELIST)))
-        return
-    cmd_id = new_cmd_id("run")
-    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "run", "ts": time.time(), "script": script}
-    queue.append({"id": cmd_id, "cmd": "run", "script": script, "args": list(args)})
-    await ctx.send("Queued run")
+      for slot = 1, size do
+        scanned_slots = scanned_slots + 1
+        -- destroyStack usually errors on invalid slot; pcall keeps it silent
+        local ok = pcall(inv.destroyStack, slot)
+        if ok then
+          -- We can't reliably know if it actually deleted something without getStackInSlot on that same peripheral,
+          -- so "deleted" is a best-effort count. Many destroyStack impls return true/false; CC doesn't guarantee it.
+          deleted = deleted + 1
+        end
+      end
+    end
+  end
 
-# ---------------- HTTP API ----------------
-@app.route("/next", methods=["GET"])
-def http_next():
-    if queue:
-        cmd = queue.popleft()
-        return (to_lua_table(cmd), 200, {"Content-Type": "text/plain"})
-    return ("{cmd=nil}", 200, {"Content-Type": "text/plain"})
+  return true, deleted, scanned_slots, touched_inventories, "ok"
+end
 
-@app.route("/result", methods=["POST"])
-def http_result():
-    # Keep this while debugging; remove later if you want
-    print("HIT /result", request.data)
+local function runScript(script, args)
+  if not SCRIPT_WHITELIST[script] then
+    return false, "not whitelisted"
+  end
+  if not fs.exists(script) then
+    return false, "file not found"
+  end
 
-    data = request.get_json(silent=True) or {}
-    last_results.appendleft(data)
+  local ok, ret = pcall(function()
+    if type(args) == "table" and #args > 0 then
+      return shell.run(script, unpack(args))
+    else
+      return shell.run(script)
+    end
+  end)
 
-    cmd_id = data.get("id")
-    if not cmd_id:
-        return jsonify({"ok": True})
+  if not ok then
+    return false, "lua error: " .. tostring(ret)
+  end
+  if ret ~= true then
+    return false, "script returned false"
+  end
+  return true, "ok"
+end
 
-    meta = pending.pop(cmd_id, None)
-    if not meta:
-        return jsonify({"ok": True})
+while true do
+  local data = httpGetCmd("/next")
 
-    channel_id = meta["channel_id"]
-    cmd = meta["cmd"]
+  if data and data.cmd then
+    local id = data.id
+    local cmd = data.cmd
 
-    if cmd == "inspect":
-        text = format_inspect(data.get("inventories", {}))
-    elif cmd == "destroy":
-        status = data.get("status", "unknown")
-        deleted = data.get("deleted", 0)
-        scanned = data.get("scanned_slots", 0)
-        touched = data.get("touched_inventories", 0)
-        msg = data.get("message", "")
-        text = f"**destroy** → **{status}** | deleted={deleted} | slots={scanned} | inventories={touched}\n{msg}".strip()
-    elif cmd == "run":
-        script = data.get("script", meta.get("script") or "?")
-        status = data.get("status", "unknown")
-        msg = data.get("message", "")
-        text = f"**run** `{script}` → **{status}**\n{msg}".strip()
-    else:
-        text = str(data)[:1900]
+    if cmd == "inspect" then
+      local ok, invOrErr = pcall(inspectInventories)
+      if ok then
+        httpPostJSON("/result", { id = id, cmd = "inspect", inventories = invOrErr })
+      else
+        httpPostJSON("/result", { id = id, cmd = "inspect", inventories = {}, status = "fail", message = tostring(invOrErr) })
+      end
 
-    send_channel_threadsafe(channel_id, text)
-    return jsonify({"ok": True})
+    elseif cmd == "destroy" then
+      local ok, deleted, scanned, touched, msg = destroyAll()
+      httpPostJSON("/result", {
+        id = id,
+        cmd = "destroy",
+        status = ok and "ok" or "fail",
+        deleted = deleted,
+        scanned_slots = scanned,
+        touched_inventories = touched,
+        message = msg
+      })
 
-@app.route("/debug", methods=["GET"])
-def http_debug():
-    return jsonify({
-        "queue_len": len(queue),
-        "queue_head": list(queue)[:3],
-        "pending_len": len(pending),
-        "pending_keys": list(pending.keys())[:20],
-        "last_results_count": len(last_results),
-    })
+    elseif cmd == "run" and data.script then
+      local okRun, msg = runScript(data.script, data.args)
+      httpPostJSON("/result", {
+        id = id,
+        cmd = "run",
+        script = data.script,
+        status = okRun and "ok" or "fail",
+        message = msg
+      })
+    end
+  end
 
-@app.route("/last", methods=["GET"])
-def http_last():
-    return jsonify(list(last_results))
-
-def run_http():
-    app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False)
-
-# ---------------- MAIN ----------------
-threading.Thread(target=run_http, daemon=True).start()
-bot.run(BOT_TOKEN)
+  sleep(POLL_DELAY)
+end
