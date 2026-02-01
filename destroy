@@ -1,0 +1,197 @@
+import time
+import threading
+import asyncio
+from collections import deque
+
+from flask import Flask, jsonify, request
+
+import discord
+from discord.ext import commands
+
+# ---------------- CONFIG ----------------
+BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+HTTP_PORT = 8080
+
+# Keep run whitelist for other scripts (optional)
+SCRIPT_WHITELIST = {
+    "status.lua",
+}
+
+# ---------------- STATE ----------------
+queue = deque()
+pending = {}
+last_results = deque(maxlen=20)
+
+app = Flask(__name__)
+
+# ---------------- HELPERS ----------------
+def new_cmd_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time())}-{len(pending)+1}"
+
+def chunk_text(text: str, limit: int = 1900):
+    if not text:
+        return ["(empty)"]
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
+
+def to_lua_table(obj) -> str:
+    if obj is None:
+        return "nil"
+    if isinstance(obj, bool):
+        return "true" if obj else "false"
+    if isinstance(obj, (int, float)):
+        return str(obj)
+    if isinstance(obj, str):
+        s = obj.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{s}"'
+    if isinstance(obj, (list, tuple)):
+        return "{" + ",".join(to_lua_table(x) for x in obj) + "}"
+    if isinstance(obj, dict):
+        parts = []
+        for k, v in obj.items():
+            if isinstance(k, str) and k.isidentifier():
+                parts.append(f"{k}={to_lua_table(v)}")
+            else:
+                parts.append(f"[{to_lua_table(k)}]={to_lua_table(v)}")
+        return "{" + ",".join(parts) + "}"
+    return to_lua_table(str(obj))
+
+def format_inspect(inventories: dict) -> str:
+    if not inventories:
+        return "(no inventories returned)"
+    preferred = ["top", "bottom", "left", "right", "front", "back", "up", "down"]
+    sides = sorted(inventories.keys(), key=lambda s: (preferred.index(s) if s in preferred else 999, s))
+    lines = []
+    for side in sides:
+        items = inventories.get(side) or []
+        lines.append(f"**{side}** ({len(items)} stacks)")
+        if not items:
+            lines.append("- (empty)\n")
+            continue
+        items = sorted(items, key=lambda it: int(it.get("slot", 0)))
+        for it in items:
+            slot = it.get("slot", "?")
+            name = it.get("name", "?")
+            count = it.get("count", "?")
+            dmg = it.get("damage", 0)
+            if dmg and int(dmg) != 0:
+                lines.append(f"- slot {slot}: `{name}` x{count} (dmg {dmg})")
+            else:
+                lines.append(f"- slot {slot}: `{name}` x{count}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+# ---------------- DISCORD BOT ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+async def send_channel(channel_id: int, text: str):
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception:
+            return
+    for part in chunk_text(text):
+        await ch.send(part)
+
+def send_channel_threadsafe(channel_id: int, text: str):
+    asyncio.run_coroutine_threadsafe(send_channel(channel_id, text), bot.loop)
+
+@bot.event
+async def on_ready():
+    print("Bot logged in as", bot.user)
+
+@bot.command()
+async def inspect(ctx):
+    cmd_id = new_cmd_id("inspect")
+    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "inspect", "ts": time.time()}
+    queue.append({"id": cmd_id, "cmd": "inspect"})
+    await ctx.send("Queued inspect")
+
+@bot.command()
+async def destroy(ctx):
+    # Destroys stacks via polling program (no separate file)
+    cmd_id = new_cmd_id("destroy")
+    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "destroy", "ts": time.time()}
+    queue.append({"id": cmd_id, "cmd": "destroy"})
+    await ctx.send("Queued destroy")
+
+@bot.command()
+async def run(ctx, script: str, *args):
+    script = script.strip()
+    if script not in SCRIPT_WHITELIST:
+        await ctx.send("Not allowed. Whitelist: " + ", ".join(sorted(SCRIPT_WHITELIST)))
+        return
+    cmd_id = new_cmd_id("run")
+    pending[cmd_id] = {"channel_id": int(ctx.channel.id), "cmd": "run", "ts": time.time(), "script": script}
+    queue.append({"id": cmd_id, "cmd": "run", "script": script, "args": list(args)})
+    await ctx.send("Queued run")
+
+# ---------------- HTTP API ----------------
+@app.route("/next", methods=["GET"])
+def http_next():
+    if queue:
+        cmd = queue.popleft()
+        return (to_lua_table(cmd), 200, {"Content-Type": "text/plain"})
+    return ("{cmd=nil}", 200, {"Content-Type": "text/plain"})
+
+@app.route("/result", methods=["POST"])
+def http_result():
+    # Keep this while debugging; remove later if you want
+    print("HIT /result", request.data)
+
+    data = request.get_json(silent=True) or {}
+    last_results.appendleft(data)
+
+    cmd_id = data.get("id")
+    if not cmd_id:
+        return jsonify({"ok": True})
+
+    meta = pending.pop(cmd_id, None)
+    if not meta:
+        return jsonify({"ok": True})
+
+    channel_id = meta["channel_id"]
+    cmd = meta["cmd"]
+
+    if cmd == "inspect":
+        text = format_inspect(data.get("inventories", {}))
+    elif cmd == "destroy":
+        status = data.get("status", "unknown")
+        deleted = data.get("deleted", 0)
+        scanned = data.get("scanned_slots", 0)
+        touched = data.get("touched_inventories", 0)
+        msg = data.get("message", "")
+        text = f"**destroy** → **{status}** | deleted={deleted} | slots={scanned} | inventories={touched}\n{msg}".strip()
+    elif cmd == "run":
+        script = data.get("script", meta.get("script") or "?")
+        status = data.get("status", "unknown")
+        msg = data.get("message", "")
+        text = f"**run** `{script}` → **{status}**\n{msg}".strip()
+    else:
+        text = str(data)[:1900]
+
+    send_channel_threadsafe(channel_id, text)
+    return jsonify({"ok": True})
+
+@app.route("/debug", methods=["GET"])
+def http_debug():
+    return jsonify({
+        "queue_len": len(queue),
+        "queue_head": list(queue)[:3],
+        "pending_len": len(pending),
+        "pending_keys": list(pending.keys())[:20],
+        "last_results_count": len(last_results),
+    })
+
+@app.route("/last", methods=["GET"])
+def http_last():
+    return jsonify(list(last_results))
+
+def run_http():
+    app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, use_reloader=False)
+
+# ---------------- MAIN ----------------
+threading.Thread(target=run_http, daemon=True).start()
+bot.run(BOT_TOKEN)
