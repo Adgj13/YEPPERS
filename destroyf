@@ -1,0 +1,169 @@
+-- remote_controller.lua
+-- Integrated commands: inspect + destroy + optional run
+-- CC: serializeJSON YES, unserializeJSON NO, so /next must be Lua-table string.
+
+local BASE_URL = "https://sixtypenny-occupiedly-leila.ngrok-free.dev"
+local POLL_DELAY = 10
+
+local SCRIPT_WHITELIST = {
+  ["status.lua"] = true,
+}
+
+local function httpGetCmd(path)
+  local h = http.get(BASE_URL .. path)
+  if not h then return nil end
+  local body = h.readAll()
+  h.close()
+  local ok, obj = pcall(textutils.unserialize, body)
+  if ok then return obj end
+  return nil
+end
+
+local function httpPostJSON(path, data)
+  local payload = textutils.serializeJSON(data)
+  local h = http.post(BASE_URL .. path, payload, { ["Content-Type"] = "application/json" })
+  if not h then return false end
+  h.close()
+  return true
+end
+
+local function getInvSize(inv)
+  if type(inv.size) == "function" then
+    local ok, v = pcall(inv.size)
+    if ok and type(v) == "number" then return v end
+  end
+  if type(inv.getInventorySize) == "function" then
+    local ok, v = pcall(inv.getInventorySize)
+    if ok and type(v) == "number" then return v end
+  end
+  return 0
+end
+
+local function inspectInventories()
+  local result = {}
+  local names = peripheral.getNames()
+
+  for i = 1, #names do
+    local side = names[i]
+    local inv = peripheral.wrap(side)
+
+    if inv and type(inv.getStackInSlot) == "function" then
+      local size = getInvSize(inv)
+      local slots = {}
+
+      for slot = 1, size do
+        local ok, stack = pcall(inv.getStackInSlot, slot)
+        if ok and stack then
+          slots[#slots + 1] = {
+            slot = slot,
+            name = stack.name or stack.id or "?",
+            count = stack.count or stack.qty or 1,
+            damage = stack.damage or 0
+          }
+        end
+      end
+
+      result[side] = slots
+    end
+  end
+
+  return result
+end
+
+-- Integrated destroy: destroys everything ONLY on inventories that expose destroyStack
+local function destroyAll()
+  local names = peripheral.getNames()
+  local deleted = 0
+  local scanned_slots = 0
+  local touched_inventories = 0
+
+  for i = 1, #names do
+    local side = names[i]
+    local inv = peripheral.wrap(side)
+
+    if inv and type(inv.destroyStack) == "function" then
+      touched_inventories = touched_inventories + 1
+      local size = getInvSize(inv)
+
+      for slot = 1, size do
+        scanned_slots = scanned_slots + 1
+        -- destroyStack usually errors on invalid slot; pcall keeps it silent
+        local ok = pcall(inv.destroyStack, slot)
+        if ok then
+          -- We can't reliably know if it actually deleted something without getStackInSlot on that same peripheral,
+          -- so "deleted" is a best-effort count. Many destroyStack impls return true/false; CC doesn't guarantee it.
+          deleted = deleted + 1
+        end
+      end
+    end
+  end
+
+  return true, deleted, scanned_slots, touched_inventories, "ok"
+end
+
+local function runScript(script, args)
+  if not SCRIPT_WHITELIST[script] then
+    return false, "not whitelisted"
+  end
+  if not fs.exists(script) then
+    return false, "file not found"
+  end
+
+  local ok, ret = pcall(function()
+    if type(args) == "table" and #args > 0 then
+      return shell.run(script, unpack(args))
+    else
+      return shell.run(script)
+    end
+  end)
+
+  if not ok then
+    return false, "lua error: " .. tostring(ret)
+  end
+  if ret ~= true then
+    return false, "script returned false"
+  end
+  return true, "ok"
+end
+
+while true do
+  local data = httpGetCmd("/next")
+
+  if data and data.cmd then
+    local id = data.id
+    local cmd = data.cmd
+
+    if cmd == "inspect" then
+      local ok, invOrErr = pcall(inspectInventories)
+      if ok then
+        httpPostJSON("/result", { id = id, cmd = "inspect", inventories = invOrErr })
+      else
+        httpPostJSON("/result", { id = id, cmd = "inspect", inventories = {}, status = "fail", message = tostring(invOrErr) })
+      end
+
+    elseif cmd == "destroy" then
+      local ok, deleted, scanned, touched, msg = destroyAll()
+      httpPostJSON("/result", {
+        id = id,
+        cmd = "destroy",
+        status = ok and "ok" or "fail",
+        deleted = deleted,
+        scanned_slots = scanned,
+        touched_inventories = touched,
+        message = msg
+      })
+
+    elseif cmd == "run" and data.script then
+      local okRun, msg = runScript(data.script, data.args)
+      httpPostJSON("/result", {
+        id = id,
+        cmd = "run",
+        script = data.script,
+        status = okRun and "ok" or "fail",
+        message = msg
+      })
+    end
+  end
+
+  sleep(POLL_DELAY)
+end
